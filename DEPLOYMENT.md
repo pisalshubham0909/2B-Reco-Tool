@@ -17,8 +17,27 @@ Streamlit offers free hosting directly from GitHub.
 ### Steps:
 1. **Create a GitHub Account**: If you don't have one, sign up at [github.com](https://github.com).
 2. **Create a Repository**:
-   * Create a new repository (can be set to **Private** to protect your source code).
-   * Upload all files from this folder (`app.py`, `parser.py`, `reconciliation.py`, `requirements.txt`, and `.streamlit/config.toml`) into the repository.
+   * Create a new repository on your GitHub account page. You can set it to **Private** so that only you and your team can see the code.
+   * **Choose one of these 3 methods to upload the code**:
+     * **Method A: Direct Website Drag & Drop (Easiest)**:
+       On your new GitHub repository page, click the **"uploading an existing file"** link. Drag and drop all the files from this folder (`app.py`, `parser.py`, `reconciliation.py`, `requirements.txt`, `.gitignore`, and `.streamlit/config.toml`) directly into your browser window, then click **"Commit changes"**.
+     * **Method B: Using GitHub Desktop App (Recommended for Windows)**:
+       1. Download and install [GitHub Desktop](https://desktop.github.com/).
+       2. Open the app, log in to your GitHub account, and go to **File > Add Local Repository...**
+       3. Select your project folder: `C:\Users\spisa\OneDrive\Automation folder\2B Reco Tool`
+       4. GitHub Desktop will ask if you want to initialize it as a repository; click **Yes**.
+       5. Enter a commit message (e.g., "Initial commit") and click **"Commit to main"**.
+       6. Click **"Publish Repository"**, choose Private/Public, and upload it.
+     * **Method C: Using Git Command Line**:
+       If you install Git from [git-scm.com](https://git-scm.com), open a terminal in this folder and run:
+       ```bash
+       git init
+       git add .
+       git commit -m "Initial commit of GSTR-2B Reco Tool"
+       git branch -M main
+       git remote add origin <YOUR_GITHUB_REPOSITORY_URL>
+       git push -u origin main
+       ```
 3. **Connect to Streamlit Cloud**:
    * Visit [share.streamlit.io](https://share.streamlit.io) and log in using your GitHub account.
    * Click **"Create app"** (or **"New app"**).
