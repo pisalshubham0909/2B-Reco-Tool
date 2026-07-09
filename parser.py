@@ -5,37 +5,58 @@ import numpy as np
 import gc
 from openpyxl import load_workbook
 
+# Shadow built-in float in module scope to handle currency symbols, commas, and malformed inputs robustly
+_builtin_float = float
+def float(val):
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, _builtin_float)):
+        return _builtin_float(val)
+    try:
+        val_str = str(val).replace(',', '').replace('₹', '').replace('$', '').strip()
+        if not val_str or val_str.lower() in ('none', 'nan', 'null', ''):
+            return 0.0
+        return _builtin_float(val_str)
+    except Exception:
+        return 0.0
+
 def get_json_section(data, key):
+
     """
     Search recursively or through common GSTR-2B JSON wrappers for a specific key.
     """
     if not isinstance(data, dict):
         return []
     
+    raw_val = []
     # Direct match
     if key in data:
-        return data[key]
-    
+        raw_val = data[key]
     # Check standard 'data' wrappers
-    if 'data' in data:
+    elif 'data' in data:
         inner = data['data']
         if isinstance(inner, dict):
             if key in inner:
-                return inner[key]
-            if 'data' in inner:
+                raw_val = inner[key]
+            elif 'data' in inner:
                 double_inner = inner['data']
                 if isinstance(double_inner, dict) and key in double_inner:
-                    return double_inner[key]
+                    raw_val = double_inner[key]
                 
-    # Exhaustive search for the key (as a fallback)
-    for k, v in data.items():
-        if k == key and isinstance(v, list):
-            return v
-        if isinstance(v, dict):
-            res = get_json_section(v, key)
-            if res:
-                return res
-            
+    if not raw_val:
+        # Exhaustive search for the key (as a fallback)
+        for k, v in data.items():
+            if k == key:
+                raw_val = v
+                break
+            if isinstance(v, dict):
+                res = get_json_section(v, key)
+                if res:
+                    raw_val = res
+                    break
+
+    if isinstance(raw_val, list):
+        return [item for item in raw_val if isinstance(item, dict)]
     return []
 
 def clean_invoice_number(inv_no):
@@ -45,10 +66,16 @@ def clean_invoice_number(inv_no):
     - Strips whitespace.
     - Removes non-alphanumeric characters.
     - Strips leading zeros.
+    - Strips float trailing decimals (.0 / .00).
     """
     if pd.isna(inv_no) or inv_no is None:
         return ""
     inv_str = str(inv_no).strip().upper()
+    # Remove floating point suffix if parsed as float
+    if inv_str.endswith('.0'):
+        inv_str = inv_str[:-2]
+    elif inv_str.endswith('.00'):
+        inv_str = inv_str[:-3]
     # Remove all non-alphanumeric characters (e.g., slash, dash, spaces)
     cleaned = re.sub(r'[^A-Z0-9]', '', inv_str)
     # Strip leading zeros
@@ -63,7 +90,7 @@ def parse_date(date_val):
         return pd.NaT
     if isinstance(date_val, pd.Timestamp):
         return date_val
-    if isinstance(date_val, (int, float)):
+    if isinstance(date_val, (int, _builtin_float)):
         # Excel numeric date handling
         try:
             return pd.to_datetime(date_val, unit='D', origin='1899-12-30')
@@ -97,6 +124,26 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
         # File-like object
         data = json.load(json_content_or_path)
 
+    # Handle double serialization (where JSON contains a stringified JSON object)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            pass
+
+    if not isinstance(data, dict):
+        raise ValueError("Invalid GSTR-2B JSON structure: Root element must be a dictionary/object.")
+
+    # Helper function to recursively lowercase all dictionary keys to resolve portal casing discrepancies
+    def lowercase_keys_recursive(d):
+        if isinstance(d, list):
+            return [lowercase_keys_recursive(v) for v in d]
+        if isinstance(d, dict):
+            return {k.lower(): lowercase_keys_recursive(v) for k, v in d.items()}
+        return d
+
+    data = lowercase_keys_recursive(data)
+
     # Attempt to extract return period and recipient GSTIN
     rtn_period = data.get('rtnprd') or data.get('fp')
     recipient_gstin = data.get('gstin') or data.get('rcptgstin')
@@ -109,21 +156,52 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
 
     # Helper function to extract document list from standard formats
     def get_doc_list(parent_obj):
+        if not isinstance(parent_obj, dict):
+            return []
+        doc_list = []
         if 'doclist' in parent_obj:
-            return parent_obj['doclist']
-        if 'inv' in parent_obj:
-            return parent_obj['inv']
-        if 'nt' in parent_obj:
-            return parent_obj['nt']
-        if 'boe' in parent_obj:
-            return parent_obj['boe']
+            doc_list = parent_obj['doclist']
+        elif 'inv' in parent_obj:
+            doc_list = parent_obj['inv']
+        elif 'nt' in parent_obj:
+            doc_list = parent_obj['nt']
+        elif 'boe' in parent_obj:
+            doc_list = parent_obj['boe']
+            
+        if isinstance(doc_list, list):
+            return [item for item in doc_list if isinstance(item, dict)]
         return []
+
+    # Helper function to extract tax values from items robustly, checking 'itm_det' and synonyms
+    def extract_tax_from_items(items):
+        txval_sum = 0.0
+        igst_sum = 0.0
+        cgst_sum = 0.0
+        sgst_sum = 0.0
+        cess_sum = 0.0
+        if not items:
+            return txval_sum, igst_sum, cgst_sum, sgst_sum, cess_sum
+            
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            det = item.get('itm_det') or item.get('itmdet')
+            if not isinstance(det, dict):
+                det = item
+                
+            txval_sum += float(det.get('txval') or 0.0)
+            igst_sum += float(det.get('iamt') or det.get('igst') or 0.0)
+            cgst_sum += float(det.get('camt') or det.get('cgst') or 0.0)
+            sgst_sum += float(det.get('samt') or det.get('sgst') or 0.0)
+            cess_sum += float(det.get('csamt') or det.get('cess') or 0.0)
+            
+        return txval_sum, igst_sum, cgst_sum, sgst_sum, cess_sum
 
     # 1. Parse B2B Invoices
     b2b_list = get_json_section(data, 'b2b')
     for supplier in b2b_list:
         ctin = supplier.get('ctin', '').strip().upper()
-        cname = supplier.get('lglNm') or supplier.get('trdNm') or ""
+        cname = supplier.get('lglnm') or supplier.get('trdnm') or ""
         doc_list = get_doc_list(supplier)
         
         for inv in doc_list:
@@ -134,14 +212,10 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             pos = inv.get('pos') or ""
             rchrg = inv.get('rchrg') or inv.get('rc') or 'N'
             filing_date = inv.get('flddt') or inv.get('fld_dt') or inv.get('filing_date') or ""
-            gstr3b_status = inv.get('g3bfil') or inv.get('g3bFilingStatus') or inv.get('g3bStatus') or 'N'
+            gstr3b_status = inv.get('g3bfil') or inv.get('g3bfilingstatus') or inv.get('g3bstatus') or 'N'
             
-            items = inv.get('items', [])
-            txval = sum(float(item.get('txval', 0.0)) for item in items)
-            igst = sum(float(item.get('igst', 0.0)) for item in items)
-            cgst = sum(float(item.get('cgst', 0.0)) for item in items)
-            sgst = sum(float(item.get('sgst', 0.0)) for item in items)
-            cess = sum(float(item.get('cess', 0.0)) for item in items)
+            items = inv.get('items') or inv.get('itms') or []
+            txval, igst, cgst, sgst, cess = extract_tax_from_items(items)
             
             documents.append({
                 'supplier_gstin': ctin,
@@ -174,7 +248,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
     b2ba_list = get_json_section(data, 'b2ba')
     for supplier in b2ba_list:
         ctin = supplier.get('ctin', '').strip().upper()
-        cname = supplier.get('lglNm') or supplier.get('trdNm') or ""
+        cname = supplier.get('lglnm') or supplier.get('trdnm') or ""
         doc_list = get_doc_list(supplier)
         
         for inv in doc_list:
@@ -187,14 +261,10 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             pos = inv.get('pos') or ""
             rchrg = inv.get('rchrg') or inv.get('rc') or 'N'
             filing_date = inv.get('flddt') or inv.get('fld_dt') or inv.get('filing_date') or ""
-            gstr3b_status = inv.get('g3bfil') or inv.get('g3bFilingStatus') or inv.get('g3bStatus') or 'N'
+            gstr3b_status = inv.get('g3bfil') or inv.get('g3bfilingstatus') or inv.get('g3bstatus') or 'N'
             
-            items = inv.get('items', [])
-            txval = sum(float(item.get('txval', 0.0)) for item in items)
-            igst = sum(float(item.get('igst', 0.0)) for item in items)
-            cgst = sum(float(item.get('cgst', 0.0)) for item in items)
-            sgst = sum(float(item.get('sgst', 0.0)) for item in items)
-            cess = sum(float(item.get('cess', 0.0)) for item in items)
+            items = inv.get('items') or inv.get('itms') or []
+            txval, igst, cgst, sgst, cess = extract_tax_from_items(items)
             
             documents.append({
                 'supplier_gstin': ctin,
@@ -227,7 +297,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
     cdnr_list = get_json_section(data, 'cdnr')
     for supplier in cdnr_list:
         ctin = supplier.get('ctin', '').strip().upper()
-        cname = supplier.get('lglNm') or supplier.get('trdNm') or ""
+        cname = supplier.get('lglnm') or supplier.get('trdnm') or ""
         doc_list = get_doc_list(supplier)
         
         for nt in doc_list:
@@ -239,14 +309,10 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             pos = nt.get('pos') or ""
             rchrg = nt.get('rchrg') or nt.get('rc') or 'N'
             filing_date = nt.get('flddt') or nt.get('fld_dt') or nt.get('filing_date') or ""
-            gstr3b_status = nt.get('g3bfil') or nt.get('g3bFilingStatus') or nt.get('g3bStatus') or 'N'
+            gstr3b_status = nt.get('g3bfil') or nt.get('g3bfilingstatus') or nt.get('g3bstatus') or 'N'
             
-            items = nt.get('items', [])
-            txval = sum(float(item.get('txval', 0.0)) for item in items)
-            igst = sum(float(item.get('igst', 0.0)) for item in items)
-            cgst = sum(float(item.get('cgst', 0.0)) for item in items)
-            sgst = sum(float(item.get('sgst', 0.0)) for item in items)
-            cess = sum(float(item.get('cess', 0.0)) for item in items)
+            items = nt.get('items') or nt.get('itms') or []
+            txval, igst, cgst, sgst, cess = extract_tax_from_items(items)
             
             # Credit notes represent negative values (ITC reduction)
             sign = -1.0 if nt_ty == 'C' else 1.0
@@ -283,7 +349,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
     cdnra_list = get_json_section(data, 'cdnra')
     for supplier in cdnra_list:
         ctin = supplier.get('ctin', '').strip().upper()
-        cname = supplier.get('lglNm') or supplier.get('trdNm') or ""
+        cname = supplier.get('lglnm') or supplier.get('trdnm') or ""
         doc_list = get_doc_list(supplier)
         
         for nt in doc_list:
@@ -297,14 +363,10 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             pos = nt.get('pos') or ""
             rchrg = nt.get('rchrg') or nt.get('rc') or 'N'
             filing_date = nt.get('flddt') or nt.get('fld_dt') or nt.get('filing_date') or ""
-            gstr3b_status = nt.get('g3bfil') or nt.get('g3bFilingStatus') or nt.get('g3bStatus') or 'N'
+            gstr3b_status = nt.get('g3bfil') or nt.get('g3bfilingstatus') or nt.get('g3bstatus') or 'N'
             
-            items = nt.get('items', [])
-            txval = sum(float(item.get('txval', 0.0)) for item in items)
-            igst = sum(float(item.get('igst', 0.0)) for item in items)
-            cgst = sum(float(item.get('cgst', 0.0)) for item in items)
-            sgst = sum(float(item.get('sgst', 0.0)) for item in items)
-            cess = sum(float(item.get('cess', 0.0)) for item in items)
+            items = nt.get('items') or nt.get('itms') or []
+            txval, igst, cgst, sgst, cess = extract_tax_from_items(items)
             
             sign = -1.0 if nt_ty == 'C' else 1.0
             doc_type = 'CRN' if nt_ty == 'C' else 'DBN'
@@ -340,7 +402,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
     isd_list = get_json_section(data, 'isd')
     for supplier in isd_list:
         ctin = supplier.get('ctin', '').strip().upper()
-        cname = supplier.get('lglNm') or supplier.get('trdNm') or ""
+        cname = supplier.get('lglnm') or supplier.get('trdnm') or ""
         doc_list = get_doc_list(supplier)
         
         for inv in doc_list:
@@ -350,23 +412,19 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             itcelg = inv.get('itcelg', 'Y').strip().upper()
             pos = inv.get('pos') or ""
             filing_date = inv.get('flddt') or inv.get('fld_dt') or inv.get('filing_date') or ""
-            gstr3b_status = inv.get('g3bfil') or inv.get('g3bFilingStatus') or inv.get('g3bStatus') or 'Y'
+            gstr3b_status = inv.get('g3bfil') or inv.get('g3bfilingstatus') or inv.get('g3bstatus') or 'Y'
             
             # ISD distribution values may be split rate-wise, sum them up
-            items = inv.get('items', [])
-            txval = sum(float(item.get('txval', 0.0)) for item in items)
-            igst = sum(float(item.get('igst', 0.0)) for item in items)
-            cgst = sum(float(item.get('cgst', 0.0)) for item in items)
-            sgst = sum(float(item.get('sgst', 0.0)) for item in items)
-            cess = sum(float(item.get('cess', 0.0)) for item in items)
+            items = inv.get('items') or inv.get('itms') or []
+            txval, igst, cgst, sgst, cess = extract_tax_from_items(items)
             
             # Fallback if items are missing
             if not items:
-                txval = float(inv.get('txval') or val)
-                igst = float(inv.get('igst') or 0.0)
-                cgst = float(inv.get('cgst') or 0.0)
-                sgst = float(inv.get('sgst') or 0.0)
-                cess = float(inv.get('cess') or 0.0)
+                txval = float(inv.get('txval') or inv.get('tx_val') or val)
+                igst = float(inv.get('igst') or inv.get('iamt') or 0.0)
+                cgst = float(inv.get('cgst') or inv.get('camt') or 0.0)
+                sgst = float(inv.get('sgst') or inv.get('samt') or 0.0)
+                cess = float(inv.get('cess') or inv.get('csamt') or 0.0)
 
             documents.append({
                 'supplier_gstin': ctin,
@@ -374,7 +432,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
                 'doc_num': docnum,
                 'clean_doc_num': clean_invoice_number(docnum),
                 'doc_date': parse_date(docdt),
-                'doc_type': 'INV',
+                'doc_type': 'ISD',
                 'taxable_val': round(txval, 2),
                 'igst': round(igst, 2),
                 'cgst': round(cgst, 2),
@@ -399,7 +457,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
     isda_list = get_json_section(data, 'isda')
     for supplier in isda_list:
         ctin = supplier.get('ctin', '').strip().upper()
-        cname = supplier.get('lglNm') or supplier.get('trdNm') or ""
+        cname = supplier.get('lglnm') or supplier.get('trdnm') or ""
         doc_list = get_doc_list(supplier)
         
         for inv in doc_list:
@@ -411,21 +469,17 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             itcelg = inv.get('itcelg', 'Y').strip().upper()
             pos = inv.get('pos') or ""
             filing_date = inv.get('flddt') or inv.get('fld_dt') or inv.get('filing_date') or ""
-            gstr3b_status = inv.get('g3bfil') or inv.get('g3bFilingStatus') or inv.get('g3bStatus') or 'Y'
+            gstr3b_status = inv.get('g3bfil') or inv.get('g3bfilingstatus') or inv.get('g3bstatus') or 'Y'
             
-            items = inv.get('items', [])
-            txval = sum(float(item.get('txval', 0.0)) for item in items)
-            igst = sum(float(item.get('igst', 0.0)) for item in items)
-            cgst = sum(float(item.get('cgst', 0.0)) for item in items)
-            sgst = sum(float(item.get('sgst', 0.0)) for item in items)
-            cess = sum(float(item.get('cess', 0.0)) for item in items)
+            items = inv.get('items') or inv.get('itms') or []
+            txval, igst, cgst, sgst, cess = extract_tax_from_items(items)
             
             if not items:
-                txval = float(inv.get('txval') or val)
-                igst = float(inv.get('igst') or 0.0)
-                cgst = float(inv.get('cgst') or 0.0)
-                sgst = float(inv.get('sgst') or 0.0)
-                cess = float(inv.get('cess') or 0.0)
+                txval = float(inv.get('txval') or inv.get('tx_val') or val)
+                igst = float(inv.get('igst') or inv.get('iamt') or 0.0)
+                cgst = float(inv.get('cgst') or inv.get('camt') or 0.0)
+                sgst = float(inv.get('sgst') or inv.get('samt') or 0.0)
+                cess = float(inv.get('cess') or inv.get('csamt') or 0.0)
 
             documents.append({
                 'supplier_gstin': ctin,
@@ -433,7 +487,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
                 'doc_num': docnum,
                 'clean_doc_num': clean_invoice_number(docnum),
                 'doc_date': parse_date(docdt),
-                'doc_type': 'INV',
+                'doc_type': 'ISD',
                 'taxable_val': round(txval, 2),
                 'igst': round(igst, 2),
                 'cgst': round(cgst, 2),
@@ -460,9 +514,9 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
         boe_num = str(boe.get('boe_num') or boe.get('boenum') or boe.get('boenm') or '').strip()
         boe_dt = boe.get('boe_dt') or boe.get('boedt')
         val = float(boe.get('boe_val') or boe.get('val', 0.0))
-        txval = float(boe.get('txval', 0.0))
-        igst = float(boe.get('igst', 0.0))
-        cess = float(boe.get('cess', 0.0))
+        txval = float(boe.get('txval') or boe.get('tx_val') or 0.0)
+        igst = float(boe.get('igst') or boe.get('iamt') or 0.0)
+        cess = float(boe.get('cess') or boe.get('csamt') or 0.0)
         itcelg = boe.get('itcelg', 'Y').strip().upper()
         port_cd = boe.get('port_cd') or boe.get('port_code') or 'CUSTOMS'
         
@@ -472,7 +526,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             'doc_num': boe_num,
             'clean_doc_num': clean_invoice_number(boe_num),
             'doc_date': parse_date(boe_dt),
-            'doc_type': 'BOE',
+            'doc_type': 'IMPG',
             'taxable_val': round(txval, 2),
             'igst': round(igst, 2),
             'cgst': 0.0,
@@ -499,14 +553,14 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
         boe_num = str(boe.get('boe_num') or boe.get('boenum') or boe.get('boenm') or '').strip()
         boe_dt = boe.get('boe_dt') or boe.get('boedt')
         val = float(boe.get('boe_val') or boe.get('val', 0.0))
-        txval = float(boe.get('txval', 0.0))
-        igst = float(boe.get('igst', 0.0))
-        cess = float(boe.get('cess', 0.0))
+        txval = float(boe.get('txval') or boe.get('tx_val') or 0.0)
+        igst = float(boe.get('igst') or boe.get('iamt') or 0.0)
+        cess = float(boe.get('cess') or boe.get('csamt') or 0.0)
         itcelg = boe.get('itcelg', 'Y').strip().upper()
         
         # SEZ imports usually have the actual SEZ supplier's GSTIN
         ctin = (boe.get('ctin') or boe.get('gstin') or 'SEZ-IMPORT').strip().upper()
-        cname = boe.get('lglNm') or boe.get('trdNm') or "SEZ Supplier"
+        cname = boe.get('lglnm') or boe.get('trdnm') or "SEZ Supplier"
         pos = boe.get('pos') or ""
 
         documents.append({
@@ -515,7 +569,7 @@ def parse_gstr2b_json(json_content_or_path, file_name="GSTR2B.json"):
             'doc_num': boe_num,
             'clean_doc_num': clean_invoice_number(boe_num),
             'doc_date': parse_date(boe_dt),
-            'doc_type': 'BOE',
+            'doc_type': 'IMPG',
             'taxable_val': round(txval, 2),
             'igst': round(igst, 2),
             'cgst': 0.0,
@@ -705,13 +759,29 @@ def parse_purchase_register(file_path_or_buffer, col_mapping, sheet_name=None, c
         else:
             df[key] = 0.0
 
-    # Determine standard document type (INV, CRN, DBN)
+    # Map PR Period
+    period_col = col_mapping.get('pr_period')
+    if period_col and period_col in df_raw.columns:
+        df['pr_period'] = df_raw[period_col].fillna("").astype(str).str.strip()
+    else:
+        def fallback_period(row):
+            dt = row.get('doc_date')
+            if pd.notna(dt):
+                return dt.strftime('%m%Y')
+            return ""
+        df['pr_period'] = df.apply(fallback_period, axis=1)
+
+    # Determine standard document type (INV, CRN, DBN, IMPG, ISD)
     def determine_doc_type(row):
         t_raw = str(row.get('doc_type_raw', '')).upper()
         if 'CREDIT' in t_raw or 'CRN' in t_raw or 'CN' == t_raw or 'CDN' in t_raw:
             return 'CRN'
         elif 'DEBIT' in t_raw or 'DBN' in t_raw or 'DN' == t_raw:
             return 'DBN'
+        elif 'IMPORT' in t_raw or 'IMPG' in t_raw or 'BOE' in t_raw or 'BILL OF ENTRY' in t_raw:
+            return 'IMPG'
+        elif 'ISD' in t_raw or 'ISDA' in t_raw or 'DISTRIB' in t_raw:
+            return 'ISD'
         elif row.get('taxable_val') < 0:
             return 'CRN'
         return 'INV'
@@ -766,17 +836,18 @@ def auto_detect_columns(columns):
     keywords = {
         'supplier_gstin': ['gstin', 'gst', 'gst no', 'gstin/uin', 'supplier gst', 'ctin', 'party gst', 'vendor gstin'],
         'supplier_name': ['supplier name', 'vendor name', 'party name', 'name', 'supplier_name', 'party_name', 'lglname', 'legal name', 'vendor name'],
-        'doc_num': ['invoice number', 'invoice no', 'inv no', 'bill no', 'voucher no', 'document number', 'doc no', 'invoice_no', 'inv_num', 'inum', 'document no', 'bill number'],
-        'doc_date': ['invoice date', 'date', 'inv date', 'bill date', 'voucher date', 'doc date', 'invoice_dt', 'idt', 'invoice_date', 'bill date'],
+        'doc_num': ['invoice number', 'invoice no', 'inv no', 'bill no', 'voucher no', 'document number', 'doc no', 'invoice_no', 'inv_num', 'inum', 'document no', 'bill number', 'document no'],
+        'doc_date': ['invoice date', 'date', 'inv date', 'bill date', 'voucher date', 'doc date', 'invoice_dt', 'idt', 'invoice_date', 'bill date', 'document date'],
         'taxable_val': ['taxable value', 'taxable amount', 'taxable amt', 'taxable val', 'assessable value', 'taxable_value', 'taxable_amt', 'txval', 'purchase value'],
         'igst': ['igst', 'integrated tax', 'igst amount', 'igst amt', 'igst_amt', 'igst_val'],
         'cgst': ['cgst', 'central tax', 'cgst amount', 'cgst amt', 'cgst_amt', 'cgst_val'],
         'sgst': ['sgst', 'state tax', 'sgst amount', 'sgst amt', 'sgst_amt', 'sgst_val', 'utgst', 'utgst amt', 'utgst_amount'],
         'cess': ['cess', 'cess amount', 'cess amt', 'cess_amt', 'cess_val', 'cec'],
-        'total_val': ['total value', 'invoice value', 'total amount', 'inv value', 'bill amount', 'invoice_val', 'val', 'total_amt', 'gross value', 'invoice amount'],
+        'total_val': ['total value', 'invoice value', 'total amount', 'inv value', 'bill amount', 'invoice_val', 'val', 'total_amt', 'gross value', 'invoice amount', 'document value', 'doc value'],
         'doc_type': ['document type', 'doc type', 'voucher type', 'vtype', 'type', 'doc_type', 'voucher name'],
         'pos': ['pos', 'place of supply', 'place_of_supply', 'state code', 'supply state'],
-        'rchrg': ['rchrg', 'reverse charge', 'rcm', 'rc', 'reverse_charge']
+        'rchrg': ['rchrg', 'reverse charge', 'rcm', 'rc', 'reverse_charge'],
+        'pr_period': ['period', 'month', 'return period', 'return_period', 'pr period', 'pr_period', 'rtnprd', 'month/year', 'reco period', 'reported period', 'reported_period']
     }
     
     for field, terms in keywords.items():
@@ -791,3 +862,181 @@ def auto_detect_columns(columns):
                 break
                 
     return detected
+
+def parse_gstr2b_excel(file_path_or_obj):
+    """
+    Parses a GSTR-2B Excel spreadsheet directly downloaded from the GST Portal.
+    Extracts records from B2B, B2BA, CDNR, CDNRA, ISD, IMPG, and IMPGSEZ sheets.
+    """
+    wb = load_workbook(file_path_or_obj, read_only=True, data_only=True)
+    documents = []
+    
+    # Configuration for each worksheet type
+    sheet_configs = {
+        'b2b': {'doc_type': 'INV', 'section': 'B2B Invoices', 'is_cdnr': False},
+        'b2ba': {'doc_type': 'INV', 'section': 'B2B Amendments', 'is_cdnr': False},
+        'cdnr': {'section': 'Credit/Debit Notes', 'is_cdnr': True},
+        'cdnra': {'section': 'Amended Credit/Debit Notes', 'is_cdnr': True},
+        'isd': {'doc_type': 'ISD', 'section': 'ISD Invoices', 'is_cdnr': False},
+        'impg': {'doc_type': 'IMPG', 'section': 'Import of Goods', 'is_cdnr': False},
+        'impgsez': {'doc_type': 'IMPG', 'section': 'SEZ Import of Goods', 'is_cdnr': False}
+    }
+    
+    # Case-insensitive worksheet names index map
+    sheet_names_lower = {name.lower().strip(): name for name in wb.sheetnames}
+    
+    for key, config in sheet_configs.items():
+        matched_sheet = None
+        for name_lower, actual_name in sheet_names_lower.items():
+            # Match config key as substring of sheet name case-insensitively, avoiding false matches
+            if key == 'b2b':
+                if 'b2b' in name_lower and 'b2ba' not in name_lower:
+                    matched_sheet = actual_name
+                    break
+            elif key == 'cdnr':
+                if ('cdnr' in name_lower or 'credit' in name_lower or 'debit' in name_lower or 'note' in name_lower) and 'cdnra' not in name_lower:
+                    matched_sheet = actual_name
+                    break
+            elif key == 'impg':
+                if ('impg' in name_lower or 'import' in name_lower) and 'impgsez' not in name_lower and 'sez' not in name_lower:
+                    matched_sheet = actual_name
+                    break
+            else:
+                if key in name_lower:
+                    matched_sheet = actual_name
+                    break
+                    
+        if matched_sheet:
+            ws = wb[matched_sheet]
+            
+            # Find the header row by searching first 20 rows
+            header_row_idx = None
+            headers = []
+            row_generator = ws.iter_rows(values_only=True)
+            
+            for r_idx, row in enumerate(row_generator, start=1):
+                if r_idx > 20:
+                    break
+                row_str = [str(x).lower().strip() if x is not None else "" for x in row]
+                # Look for header indicators
+                if any('gstin' in s or 'ctin' in s or 'gst' in s or 'invoice' in s or 'doc' in s or 'bill' in s or 'boe' in s or 'note' in s for s in row_str):
+                    header_row_idx = r_idx
+                    headers = [str(x).strip() for x in row]
+                    break
+            
+            if header_row_idx is None:
+                continue
+                
+            # Iterate rows below header
+            ws_rows = ws.iter_rows(values_only=True)
+            for _ in range(header_row_idx):
+                next(ws_rows, None)
+                
+            for row in ws_rows:
+                # Skip empty or total rows
+                if not row or row[0] is None or str(row[0]).strip().lower() in ('', 'none', 'total', 'grand total'):
+                    continue
+                    
+                row_dict = {}
+                for col_idx, col_name in enumerate(headers):
+                    if col_idx < len(row) and col_name:
+                        row_dict[col_name.lower().strip()] = row[col_idx]
+                        
+                # Extract fields using extremely flexible keyword/substring matches
+                ctin_col = next((k for k in row_dict.keys() if 'gstin' in k or 'ctin' in k or 'gst' in k), None)
+                ctin = str(row_dict.get(ctin_col or '')).strip().upper() if ctin_col else ''
+                if not ctin or ctin.lower() in ('none', 'total', 'grand total'):
+                    continue
+                    
+                name_col = next((k for k in row_dict.keys() if 'name' in k or 'trade' in k or 'legal' in k or 'supplier' in k), None)
+                cname = str(row_dict.get(name_col or '')).strip() if name_col else ''
+                
+                inum_col = next((k for k in row_dict.keys() if 'invoice' in k or 'document' in k or 'doc num' in k or 'doc no' in k or 'note num' in k or 'note no' in k or 'boe num' in k or 'boe no' in k or k in ('inum', 'num', 'number', 'no')), None)
+                inum = str(row_dict.get(inum_col or '')).strip() if inum_col else ''
+                if not inum or inum.lower() in ('none', ''):
+                    continue
+                    
+                idt_col = next((k for k in row_dict.keys() if 'date' in k or 'dt' in k), None)
+                idt = row_dict.get(idt_col or '') if idt_col else None
+                
+                val_col = next((k for k in row_dict.keys() if 'value' in k or 'val' in k or 'amt' in k or 'amount' in k), None)
+                val = float(row_dict.get(val_col or 0.0) or 0.0) if val_col else 0.0
+                
+                pos_col = next((k for k in row_dict.keys() if 'place' in k or 'pos' in k or 'supply' in k), None)
+                pos = str(row_dict.get(pos_col or '')).strip() if pos_col else ''
+                
+                rc_col = next((k for k in row_dict.keys() if 'reverse' in k or 'rcm' in k or 'charge' in k or 'rc' in k), None)
+                rchrg = str(row_dict.get(rc_col or 'N')).strip().upper() if rc_col else 'N'
+                
+                txval_col = next((k for k in row_dict.keys() if 'taxable' in k or 'txval' in k or 'tx_val' in k), None)
+                txval = float(row_dict.get(txval_col or 0.0) or 0.0) if txval_col else 0.0
+                
+                igst_col = next((k for k in row_dict.keys() if 'integrated' in k or 'igst' in k or 'iamt' in k or 'int' in k), None)
+                igst = float(row_dict.get(igst_col or 0.0) or 0.0) if igst_col else 0.0
+                
+                cgst_col = next((k for k in row_dict.keys() if 'central' in k or 'cgst' in k or 'camt' in k or 'cen' in k), None)
+                cgst = float(row_dict.get(cgst_col or 0.0) or 0.0) if cgst_col else 0.0
+                
+                sgst_col = next((k for k in row_dict.keys() if 'sgst' in k or 'samt' in k or 'state/ut' in k or 'state tax' in k or 'utgst' in k), None)
+                sgst = float(row_dict.get(sgst_col or 0.0) or 0.0) if sgst_col else 0.0
+                
+                cess_col = next((k for k in row_dict.keys() if 'cess' in k or 'csamt' in k), None)
+                cess = float(row_dict.get(cess_col or 0.0) or 0.0) if cess_col else 0.0
+                
+                itc_col = next((k for k in row_dict.keys() if 'eligible' in k or 'eligibility' in k or 'availability' in k or 'itc' in k or 'avail' in k), None)
+                itcelg = str(row_dict.get(itc_col or 'Y')).strip().upper() if itc_col else 'Y'
+                itc_eligibility = 'Eligible' if 'ineligible' not in itcelg.lower() and itcelg in ('Y', 'YES', 'ELIGIBLE') else 'Ineligible'
+                
+                fld_col = next((k for k in row_dict.keys() if 'filing date' in k or 'filing dt' in k or 'flddt' in k or 'fld_dt' in k or 'filed date' in k), None)
+                filing_date = row_dict.get(fld_col or '') if fld_col else ''
+                
+                g3b_col = next((k for k in row_dict.keys() if 'gstr-3b' in k or '3b' in k or 'filing status' in k or 'status' in k), None)
+                gstr3b_status = 'Yes' if str(row_dict.get(g3b_col or 'N')).strip().upper() in ('Y', 'YES', 'FILED') else 'No'
+                
+                period_col = next((k for k in row_dict.keys() if 'period' in k or 'month' in k or 'year' in k or 'fp' in k or 'rtn' in k), None)
+                rtn_period = str(row_dict.get(period_col or '')).strip() if period_col else ''
+                
+                doc_type = config.get('doc_type', 'INV')
+                sign = 1.0
+                
+                if config['is_cdnr']:
+                    ty_col = next((k for k in row_dict.keys() if 'type' in k or 'note type' in k or 'nt_ty' in k), None)
+                    ty = str(row_dict.get(ty_col or '')).strip().upper() if ty_col else ''
+                    if 'credit' in ty.lower() or 'c' in ty.lower():
+                        doc_type = 'CRN'
+                        sign = -1.0
+                    else:
+                        doc_type = 'DBN'
+                        sign = 1.0
+                        
+                documents.append({
+                    'supplier_gstin': ctin,
+                    'supplier_name': cname,
+                    'doc_num': inum,
+                    'clean_doc_num': clean_invoice_number(inum),
+                    'doc_date': parse_date(idt),
+                    'doc_type': doc_type,
+                    'taxable_val': round(txval * sign, 2),
+                    'igst': round(igst * sign, 2),
+                    'cgst': round(cgst * sign, 2),
+                    'sgst': round(sgst * sign, 2),
+                    'cess': round(cess * sign, 2),
+                    'total_val': round(val * sign, 2),
+                    'pos': pos,
+                    'rchrg': 'Yes' if rchrg in ('Y', 'YES') else 'No',
+                    'itc_eligibility': itc_eligibility,
+                    'filing_date': parse_date(filing_date),
+                    'gstr3b_status': gstr3b_status,
+                    'section': config['section'],
+                    'is_amended': 'amendment' in config['section'].lower(),
+                    'original_doc_num': None,
+                    'original_doc_date': None,
+                    'rtn_period': rtn_period,
+                    'source': 'GSTR-2B',
+                    'source_file': getattr(file_path_or_obj, 'name', 'GSTR2B_Portal.xlsx')
+                })
+                
+    wb.close()
+    if not documents:
+        return pd.DataFrame()
+    return pd.DataFrame(documents)

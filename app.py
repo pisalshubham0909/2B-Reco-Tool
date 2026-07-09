@@ -3,8 +3,8 @@ import pandas as pd
 import numpy as np
 import io
 import json
-from parser import parse_gstr2b_json, parse_purchase_register, auto_detect_columns
-from reconciliation import reconcile_data, generate_supplier_summary
+from parser import parse_gstr2b_json, parse_gstr2b_excel, parse_purchase_register, auto_detect_columns, clean_invoice_number
+from engine import reconcile_data, generate_supplier_summary
 import plotly.express as px
 import plotly.graph_objects as go
 from openpyxl import Workbook, load_workbook
@@ -99,231 +99,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Generate Synthetic Data function including new GST edge cases (RCM, ISD, SEZ, Late files)
-def get_synthetic_data():
-    # 1. Create GSTR-2B Data
-    gstr2b_json_content = {
-        "gstin": "27MYCOMPANY123Z0",
-        "rtnprd": "032026",
-        "b2b": [
-            {
-                "ctin": "27ABCDE1234F1Z5",
-                "lglNm": "Alpha Suppliers Ltd",
-                "inv": [
-                    {
-                        "inum": "INV-101",
-                        "idt": "10-03-2026",
-                        "val": 118000.0,
-                        "pos": "27",
-                        "rchrg": "N",
-                        "inv_typ": "R",
-                        "itcelg": "Y",
-                        "flddt": "11-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 100000.0, "igst": 0.0, "cgst": 9000.0, "sgst": 9000.0, "cess": 0.0}]
-                    }
-                ]
-            },
-            {
-                "ctin": "27FGHIJ5678K2Z9",
-                "lglNm": "Beta Enterprise",
-                "inv": [
-                    {
-                        "inum": "INV-201",
-                        "idt": "15-03-2026",
-                        "val": 23600.0,
-                        "pos": "27",
-                        "rchrg": "N",
-                        "inv_typ": "R",
-                        "itcelg": "Y",
-                        "flddt": "10-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 20000.0, "igst": 3600.0, "cgst": 0.0, "sgst": 0.0, "cess": 0.0}]
-                    },
-                    {
-                        "inum": "INV-202",
-                        "idt": "22-03-2026",
-                        "val": 11800.0,
-                        "pos": "27",
-                        "rchrg": "N",
-                        "inv_typ": "R",
-                        "itcelg": "Y",
-                        "flddt": "15-04-2026",
-                        "g3bfil": "N",  # GSTR-3B NOT FILED
-                        "items": [{"num": 1, "rt": 18.0, "txval": 10000.0, "igst": 0.0, "cgst": 900.0, "sgst": 900.0, "cess": 0.0}]
-                    }
-                ]
-            },
-            {
-                "ctin": "27KLMNO9012L3Z3",
-                "lglNm": "Gamma Corp",
-                "inv": [
-                    {
-                        "inum": "INV-301",
-                        "idt": "25-03-2026",
-                        "val": 118000.0,
-                        "pos": "27",
-                        "rchrg": "N",
-                        "inv_typ": "R",
-                        "itcelg": "N",  # Ineligible blocked ITC 17(5)
-                        "flddt": "09-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 100000.0, "igst": 0.0, "cgst": 9000.0, "sgst": 9000.0, "cess": 0.0}]
-                    },
-                    {
-                        "inum": "INV-302",
-                        "idt": "28-03-2026",
-                        "val": 17700.0,
-                        "pos": "27",
-                        "rchrg": "N",
-                        "inv_typ": "R",
-                        "itcelg": "Y",  # Target for fuzzy matching (books has "INV302-A")
-                        "flddt": "11-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 15000.0, "igst": 2700.0, "cgst": 0.0, "sgst": 0.0, "cess": 0.0}]
-                    }
-                ]
-            },
-            {
-                "ctin": "27PQRST3456M4Z1",
-                "lglNm": "Delta Logistics",
-                "inv": [
-                    {
-                        "inum": "INV-401",
-                        "idt": "29-03-2026",
-                        "val": 11800.0,
-                        "pos": "27",
-                        "rchrg": "Y",  # Reverse charge transaction
-                        "inv_typ": "R",
-                        "itcelg": "Y",
-                        "flddt": "10-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 10000.0, "igst": 0.0, "cgst": 900.0, "sgst": 900.0, "cess": 0.0}]
-                    }
-                ]
-            }
-        ],
-        "b2ba": [
-            {
-                "ctin": "27ABCDE1234F1Z5",
-                "lglNm": "Alpha Suppliers Ltd",
-                "inv": [
-                    {
-                        "inum": "INV-99A",
-                        "idt": "15-03-2026",
-                        "oinum": "INV-99",
-                        "oidt": "10-02-2026",
-                        "val": 23600.0,
-                        "pos": "27",
-                        "rchrg": "N",
-                        "inv_typ": "R",
-                        "itcelg": "Y",
-                        "flddt": "11-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 20000.0, "igst": 3600.0, "cgst": 0.0, "sgst": 0.0, "cess": 0.0}]
-                    }
-                ]
-            }
-        ],
-        "cdnr": [
-            {
-                "ctin": "27FGHIJ5678K2Z9",
-                "lglNm": "Beta Enterprise",
-                "nt": [
-                    {
-                        "nt_num": "CN-01",
-                        "nt_dt": "20-03-2026",
-                        "val": 5900.0,
-                        "nt_ty": "C",
-                        "inum": "INV-201",
-                        "idt": "15-03-2026",
-                        "itcelg": "Y",
-                        "pos": "27",
-                        "rchrg": "N",
-                        "flddt": "12-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 18.0, "txval": 5000.0, "igst": 900.0, "cgst": 0.0, "sgst": 0.0, "cess": 0.0}]
-                    }
-                ]
-            }
-        ],
-        "isd": [
-            {
-                "ctin": "27ISDHO9999A1Z2",
-                "lglNm": "HO Head Office (ISD)",
-                "doclist": [
-                    {
-                        "docnum": "ISD-88",
-                        "docdt": "13-03-2026",
-                        "val": 18000.0,
-                        "itcelg": "Y",
-                        "pos": "27",
-                        "flddt": "13-04-2026",
-                        "g3bfil": "Y",
-                        "items": [{"num": 1, "rt": 0.0, "txval": 18000.0, "igst": 18000.0, "cgst": 0.0, "sgst": 0.0, "cess": 0.0}]
-                    }
-                ]
-            }
-        ],
-        "impgsez": [
-            {
-                "boe_num": "BOE-SEZ-99",
-                "boe_dt": "19-03-2026",
-                "boe_val": 177000.0,
-                "txval": 150000.0,
-                "igst": 27000.0,
-                "cess": 0.0,
-                "itcelg": "Y",
-                "ctin": "27SEZDV8888B3Z4",
-                "lglNm": "SEZ Infrastructure Ltd",
-                "pos": "27"
-            }
-        ],
-        "impg": [
-            {
-                "boe_num": "BOE-501",
-                "boe_dt": "18-03-2026",
-                "boe_val": 500000.0,
-                "port_cd": "INBOM4",
-                "txval": 400000.0,
-                "igst": 72000.0,
-                "cess": 0.0,
-                "itcelg": "Y"
-            }
-        ]
-    }
-
-    # 2. Create Books Data
-    books_data = [
-        # B2B Matched
-        {"Supplier GSTIN": "27ABCDE1234F1Z5", "Supplier Name": "Alpha Suppliers Ltd", "Invoice Number": "INV-101", "Invoice Date": "10-03-2026", "Voucher Type": "Purchase", "Taxable Value": 100000.0, "IGST": 0.0, "CGST": 9000.0, "SGST": 9000.0, "POS": "27", "RCM": "No"},
-        # Amended Invoice Match
-        {"Supplier GSTIN": "27ABCDE1234F1Z5", "Supplier Name": "Alpha Suppliers Ltd", "Invoice Number": "INV-99", "Invoice Date": "10-02-2026", "Voucher Type": "Purchase", "Taxable Value": 20000.0, "IGST": 3600.0, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # Rounded value mismatch within tolerance (₹2 difference)
-        {"Supplier GSTIN": "27FGHIJ5678K2Z9", "Supplier Name": "Beta Enterprise", "Invoice Number": "INV-201", "Invoice Date": "15-03-2026", "Voucher Type": "Purchase", "Taxable Value": 20002.0, "IGST": 3600.36, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # GSTR-3B Unfiled check
-        {"Supplier GSTIN": "27FGHIJ5678K2Z9", "Supplier Name": "Beta Enterprise", "Invoice Number": "INV-202", "Invoice Date": "22-03-2026", "Voucher Type": "Purchase", "Taxable Value": 10000.0, "IGST": 0.0, "CGST": 900.0, "SGST": 900.0, "POS": "27", "RCM": "No"},
-        # Only in books invoice
-        {"Supplier GSTIN": "27FGHIJ5678K2Z9", "Supplier Name": "Beta Enterprise", "Invoice Number": "INV-203", "Invoice Date": "24-03-2026", "Voucher Type": "Purchase", "Taxable Value": 30000.0, "IGST": 5400.0, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # Blocked ITC Match
-        {"Supplier GSTIN": "27KLMNO9012L3Z3", "Supplier Name": "Gamma Corp", "Invoice Number": "INV-301", "Invoice Date": "25-03-2026", "Voucher Type": "Purchase", "Taxable Value": 100000.0, "IGST": 0.0, "CGST": 9000.0, "SGST": 9000.0, "POS": "27", "RCM": "No"},
-        # Fuzzy match target: books has "INV302-A", JSON has "INV-302"
-        {"Supplier GSTIN": "27KLMNO9012L3Z3", "Supplier Name": "Gamma Corp", "Invoice Number": "INV302-A", "Invoice Date": "28-03-2026", "Voucher Type": "Purchase", "Taxable Value": 15000.0, "IGST": 2700.0, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # RCM match
-        {"Supplier GSTIN": "27PQRST3456M4Z1", "Supplier Name": "Delta Logistics", "Invoice Number": "INV-401", "Invoice Date": "29-03-2026", "Voucher Type": "Purchase", "Taxable Value": 10000.0, "IGST": 0.0, "CGST": 900.0, "SGST": 900.0, "POS": "27", "RCM": "Yes"},
-        # Credit Note
-        {"Supplier GSTIN": "27FGHIJ5678K2Z9", "Supplier Name": "Beta Enterprise", "Invoice Number": "CN-01", "Invoice Date": "20-03-2026", "Voucher Type": "Credit Note", "Taxable Value": 5000.0, "IGST": 900.0, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # ISD distribution match
-        {"Supplier GSTIN": "27ISDHO9999A1Z2", "Supplier Name": "HO Head Office (ISD)", "Invoice Number": "ISD-88", "Invoice Date": "13-03-2026", "Voucher Type": "ISD Journal", "Taxable Value": 18000.0, "IGST": 18000.0, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # SEZ Import match
-        {"Supplier GSTIN": "27SEZDV8888B3Z4", "Supplier Name": "SEZ Infrastructure Ltd", "Invoice Number": "BOE-SEZ-99", "Invoice Date": "19-03-2026", "Voucher Type": "Import SEZ", "Taxable Value": 150000.0, "IGST": 27000.0, "CGST": 0.0, "SGST": 0.0, "POS": "27", "RCM": "No"},
-        # Import matching
-        {"Supplier GSTIN": "IMPORT", "Supplier Name": "Import of Goods", "Invoice Number": "BOE-501", "Invoice Date": "18-03-2026", "Voucher Type": "Import BOE", "Taxable Value": 400000.0, "IGST": 72000.0, "CGST": 0.0, "SGST": 0.0, "POS": "97", "RCM": "No"}
-    ]
-    df_books = pd.DataFrame(books_data)
-    
-    return gstr2b_json_content, df_books
-
 # openpyxl Styled Excel Exporter to a Single Consolidated Sheet + Dashboard + Supplier Summary
 def export_reco_to_excel(df_reco, df_supplier, summary_stats):
     wb = Workbook()
@@ -342,10 +117,15 @@ def export_reco_to_excel(df_reco, df_supplier, summary_stats):
         'Matched': matched_fill,
         'Fuzzy Match': matched_fill,
         'Matched (Amended)': matched_fill,
+        'Matched (Value-based)': matched_fill,
         'Value Mismatch': mismatch_fill,
         'Date Mismatch': mismatch_fill,
         'Date & Value Mismatch': mismatch_fill,
         'Value Mismatch (Amended)': mismatch_fill,
+        'Tax Mismatch': mismatch_fill,
+        'Tax Mismatch (Fuzzy)': mismatch_fill,
+        'Value Mismatch (Fuzzy)': mismatch_fill,
+        'Tax Mismatch (Amended)': mismatch_fill,
         'Only in Books': books_fill,
         'Only in GSTR-2B': gstr2b_fill
     }
@@ -488,14 +268,14 @@ def export_reco_to_excel(df_reco, df_supplier, summary_stats):
         # Reorder columns to make it extremely clear (Status, Remarks, Law Remarks first)
         ordered_cols = [
             'reco_status', 'itc_action', 'remarks', 'gst_law_remark',
-            'books_gstin', 'books_supplier_name', 'books_doc_num', 'books_doc_date', 'books_doc_type',
-            'books_taxable_val', 'books_igst', 'books_cgst', 'books_sgst', 'books_cess', 'books_total_val',
-            'books_pos', 'books_rchrg', 'books_section',
             'gstr2b_gstin', 'gstr2b_supplier_name', 'gstr2b_doc_num', 'gstr2b_doc_date', 'gstr2b_doc_type',
             'gstr2b_taxable_val', 'gstr2b_igst', 'gstr2b_cgst', 'gstr2b_sgst', 'gstr2b_cess', 'gstr2b_total_val',
             'gstr2b_pos', 'gstr2b_rchrg', 'gstr2b_itc_eligibility', 'gstr2b_filing_date', 'gstr2b_gstr3b_status',
             'gstr2b_section', 'gstr2b_rtn_period', 'gstr2b_source_file',
-            'taxable_val_diff', 'igst_diff', 'cgst_diff', 'sgst_diff', 'days_diff'
+            'books_gstin', 'books_supplier_name', 'books_doc_num', 'books_doc_date', 'books_doc_type',
+            'books_taxable_val', 'books_igst', 'books_cgst', 'books_sgst', 'books_cess', 'books_total_val',
+            'books_pos', 'books_rchrg', 'books_pr_period',
+            'taxable_val_diff', 'igst_diff', 'cgst_diff', 'sgst_diff', 'cess_diff', 'days_diff'
         ]
         
         # Select and align columns present in dataframe
@@ -514,13 +294,101 @@ def export_reco_to_excel(df_reco, df_supplier, summary_stats):
     out_io.seek(0)
     return out_io
 
+def get_pr_template_bytes():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Purchase Register Template"
+    ws.views.sheetView[0].showGridLines = True
+    
+    # Header styling
+    header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    
+    headers = [
+        "Entity GSTIN", "Place of Supply", "Document Type", "Document No", 
+        "Document Date", "Document Value", "Transaction Type", "Reported Period", 
+        "Vendor GSTIN", "Vendor POS", "Taxable Value", "GST Rate", 
+        "IGST", "CGST", "SGST", "Cess Amount", "Cess Rate", "Remarks", "Other Remarks"
+    ]
+    
+    ws.append(headers)
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+        
+    # Example Row
+    ws.append([
+        "27MYCOMPANY123", "27", "INV", "INV-101", 
+        "10-03-2026", 118000.0, "Regular", "032026", 
+        "27ABCDE1234F1Z5", "27", 100000.0, 18.0, 
+        0.0, 9000.0, 9000.0, 0.0, 0.0, "Input credit invoice", "Self assessed"
+    ])
+    
+    # Instructions Sheet
+    ws_inst = wb.create_sheet(title="Instructions")
+    ws_inst.views.sheetView[0].showGridLines = True
+    ws_inst.column_dimensions['A'].width = 30
+    ws_inst.column_dimensions['B'].width = 50
+    
+    ws_inst['A1'] = "Column Name"
+    ws_inst['B1'] = "Description / Accepted Values"
+    for cell in (ws_inst['A1'], ws_inst['B1']):
+        cell.font = Font(name="Calibri", size=11, bold=True)
+        
+    instructions = [
+        ("Entity GSTIN", "The company's own GSTIN (e.g. 27MYCOMPANY123)"),
+        ("Place of Supply", "Place of supply state code (e.g. 27 for Maharashtra)"),
+        ("Document Type", "Type of voucher (INV, CRN, DBN, IMPG, ISD)"),
+        ("Document No", "Invoice / Document reference number"),
+        ("Document Date", "Date of the document (DD-MM-YYYY)"),
+        ("Document Value", "Total gross document value in INR (including taxes)"),
+        ("Transaction Type", "Transaction category (Regular, RCM, SEZ, Import)"),
+        ("Reported Period", "Filing return period in MMYYYY format (e.g. 032026)"),
+        ("Vendor GSTIN", "15-digit GSTIN of the supplier/vendor"),
+        ("Vendor POS", "Place of supply of the vendor state code (e.g. 27)"),
+        ("Taxable Value", "Net taxable value in INR"),
+        ("GST Rate", "Applicable GST tax rate percentage (e.g. 18.0)"),
+        ("IGST", "Integrated tax amount in INR"),
+        ("CGST", "Central tax amount in INR"),
+        ("SGST", "State/UT tax amount in INR"),
+        ("Cess Amount", "Cess tax amount in INR"),
+        ("Cess Rate", "Applicable Cess rate percentage"),
+        ("Remarks", "General user remarks/comments"),
+        ("Other Remarks", "Additional document-level audit notes")
+    ]
+    
+    for row_idx, (col_name, desc) in enumerate(instructions, 2):
+        ws_inst.cell(row=row_idx, column=1, value=col_name).font = Font(name="Calibri", size=11, bold=True)
+        ws_inst.cell(row=row_idx, column=2, value=desc)
+        
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
 # Main Application Streamlit UI
 st.title("💼 GSTR-2B Reconciliation Dashboard")
 st.markdown("Reconcile GSTR-2B auto-drafted statements against internal Purchase Registers under active GST Rules & Laws.")
 
 # Sidebar Configuration Controls
+if 'uploader_version' not in st.session_state:
+    st.session_state['uploader_version'] = 0
+
 with st.sidebar:
     st.header("⚙️ Reconciliation Settings")
+    
+    # Download template helper
+    st.download_button(
+        label="📥 Download PR Template",
+        data=get_pr_template_bytes(),
+        file_name="purchase_register_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help="Download standard Excel layout for the Purchase Register."
+    )
+    
+    st.markdown("---")
     
     # Tolerances
     val_tol = st.slider("Taxable Value Tolerance (₹)", min_value=0.0, max_value=100.0, value=10.0, step=1.0, 
@@ -529,6 +397,16 @@ with st.sidebar:
                          help="Allowable variance between Books invoice date and Portal filing date.")
     fuzzy_tol = st.slider("Fuzzy Match Sensitivity (%)", min_value=70, max_value=100, value=85, step=5,
                           help="Minimum invoice number similarity score to classify as fuzzy matched.")
+    tax_tol = st.slider("Tax Amount Tolerance (₹)", min_value=0.0, max_value=100.0, value=10.0, step=1.0,
+                        help="Allowable difference in IGST/CGST/SGST/Cess amounts between Books and Portal.")
+                        
+    st.markdown("---")
+    if st.button("🔄 Reset Reconciliation (Clear All)", use_container_width=True):
+        new_version = st.session_state.get('uploader_version', 0) + 1
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.session_state['uploader_version'] = new_version
+        st.rerun()
     
     cn_convention = st.selectbox(
         "Credit Note Value Sign",
@@ -542,33 +420,33 @@ with st.sidebar:
     
     # GSTR-2B File upload (1GB upload limit enabled)
     gstr2b_files = st.file_uploader(
-        "GSTR-2B JSON Files (Up to 1GB)", 
-        type="json", 
+        "GSTR-2B Portal Statements (Excel / JSON - Up to 1GB)", 
+        type=["xlsx", "xls", "json"], 
         accept_multiple_files=True,
-        help="Upload one or multiple GSTR-2B JSON statements. Supports huge size files."
+        key=f"gstr2b_uploader_{st.session_state['uploader_version']}",
+        help="Upload one or multiple GSTR-2B Excel or JSON files downloaded directly from the GST Portal."
     )
     
     # Books File upload
-    books_file = st.file_uploader(
+    books_files = st.file_uploader(
         "Purchase Register (Excel/CSV - Up to 1GB)", 
         type=["xlsx", "xls", "csv"], 
-        accept_multiple_files=False,
-        help="Upload your Purchase Register sheet."
+        accept_multiple_files=True,
+        key=f"books_uploader_{st.session_state['uploader_version']}",
+        help="Upload one or multiple Purchase Register sheets."
     )
     
-    # Sandbox Testing Button
-    st.markdown("---")
-    st.subheader("💡 Sandbox Testing")
-    if st.button("Generate & Load Synthetic Data"):
-        json_content, df_books_synth = get_synthetic_data()
-        st.session_state['synth_json'] = json_content
-        st.session_state['synth_books'] = df_books_synth
-        st.session_state['loaded_synth'] = True
-        st.success("Loaded GSTR-2B JSON and Purchase Register mock datasets featuring ISD, RCM, SEZ, Late, and Blocked ITC entries.")
+    # Sidebar layout complete
+    pass
 
-# State initialization
-if 'loaded_synth' not in st.session_state:
-    st.session_state['loaded_synth'] = False
+# Render success messages on page load after rerun
+if 'gstr2b_success_msg' in st.session_state:
+    st.success(st.session_state['gstr2b_success_msg'])
+    del st.session_state['gstr2b_success_msg']
+
+if 'books_success_msg' in st.session_state:
+    st.success(st.session_state['books_success_msg'])
+    del st.session_state['books_success_msg']
 
 # Load data logic
 gstr2b_df = pd.DataFrame()
@@ -576,78 +454,130 @@ books_df = pd.DataFrame()
 sheet_names = []
 selected_sheet = None
 
-# If user loaded synthetic data
-if st.session_state['loaded_synth']:
-    gstr2b_df = parse_gstr2b_json(json.dumps(st.session_state['synth_json']), "sample_gstr2b.json")
-    
-    col_mapping = {
-        'supplier_gstin': 'Supplier GSTIN',
-        'supplier_name': 'Supplier Name',
-        'doc_num': 'Invoice Number',
-        'doc_date': 'Invoice Date',
-        'taxable_val': 'Taxable Value',
-        'igst': 'IGST',
-        'cgst': 'CGST',
-        'sgst': 'SGST',
-        'doc_type': 'Voucher Type',
-        'pos': 'POS',
-        'rchrg': 'RCM'
-    }
-    
-    books_df = parse_purchase_register(
-        st.session_state['synth_books'], 
-        col_mapping, 
-        credit_note_convention=cn_convention
-    )
-    st.info("⚡ Active Source: Sandbox Synthetic Datasets (ISD, SEZ, RCM, unfiled G3B return cases active)")
-    
-else:
-    # 1. Parse Uploaded GSTR-2B JSON
-    if gstr2b_files:
+# 1. Parse Uploaded GSTR-2B Statement
+uploaded_g2b_sigs = [(f.name, f.size) for f in gstr2b_files] if gstr2b_files else []
+cached_g2b_sigs = st.session_state.get('gstr2b_files_sigs', [])
+
+# Detect file list change and invalidate cache immediately to prevent showing old data
+if gstr2b_files and uploaded_g2b_sigs != cached_g2b_sigs:
+    if 'gstr2b_df_parsed' in st.session_state:
+        del st.session_state['gstr2b_df_parsed']
+    st.session_state['reco_executed'] = False
+    if 'reco_results' in st.session_state:
+        del st.session_state['reco_results']
+    if 'supplier_results' in st.session_state:
+        del st.session_state['supplier_results']
+        
+if gstr2b_files:
+    st.markdown("### 🌐 GSTR-2B Statements")
+    st.info(f"Selected {len(gstr2b_files)} portal statement file(s). Click below to parse and load them into memory.")
+    if st.button("Load GSTR-2B Data"):
         dfs = []
         for file in gstr2b_files:
             file_name = file.name
             try:
-                # Read content
-                content = file.read().decode('utf-8')
-                df = parse_gstr2b_json(content, file_name)
+                # Read content: branch to Excel parser or JSON parser based on extension
+                if file_name.lower().endswith(('.xlsx', '.xlsm', '.xls')):
+                    df = parse_gstr2b_excel(file)
+                else:
+                    content = file.read().decode('utf-8')
+                    df = parse_gstr2b_json(content, file_name)
                 dfs.append(df)
             except Exception as e:
                 st.error(f"Error parsing GSTR-2B file {file_name}: {str(e)}")
         if dfs:
             gstr2b_df = pd.concat(dfs, ignore_index=True)
-            st.success(f"Successfully parsed {len(gstr2b_files)} GSTR-2B JSON file(s) ({len(gstr2b_df)} total records).")
+            if gstr2b_df.empty:
+                st.warning("⚠️ Uploaded GSTR-2B statement parsed successfully but yielded 0 document records. Please check if this is a valid GSTR-2B statement.")
+                # Run diagnostic check to display JSON keys to the user
+                for file in gstr2b_files:
+                    file.seek(0)
+                    try:
+                        data = json.loads(file.read().decode('utf-8'))
+                        if isinstance(data, str):
+                            data = json.loads(data)
+                        st.info(f"🔍 Diagnostic for `{file.name}`: Found root keys: {list(data.keys())}")
+                        if 'data' in data and isinstance(data['data'], dict):
+                            st.info(f"🔍 Diagnostic nested `data` keys: {list(data['data'].keys())}")
+                    except Exception:
+                        pass
+            else:
+                st.session_state['gstr2b_df_parsed'] = gstr2b_df
+                st.session_state['gstr2b_files_sigs'] = uploaded_g2b_sigs
+                st.session_state['gstr2b_success_msg'] = f"Successfully loaded {len(gstr2b_files)} GSTR-2B JSON file(s) ({len(gstr2b_df)} total records)."
+                # Clear reconciliation state to force recalculation on new data
+                st.session_state['reco_executed'] = False
+                if 'reco_results' in st.session_state:
+                    del st.session_state['reco_results']
+                if 'supplier_results' in st.session_state:
+                    del st.session_state['supplier_results']
+                st.rerun()
+                    
+    # Load GSTR-2B from session state if already parsed
+    if 'gstr2b_df_parsed' in st.session_state:
+        gstr2b_df = st.session_state['gstr2b_df_parsed']
+        
+    # If GSTR-2B files uploader is cleared, wipe cached data
+    if not gstr2b_files and 'gstr2b_df_parsed' in st.session_state:
+        del st.session_state['gstr2b_df_parsed']
+        if 'gstr2b_files_sigs' in st.session_state:
+            del st.session_state['gstr2b_files_sigs']
+        st.session_state['reco_executed'] = False
+        if 'reco_results' in st.session_state:
+            del st.session_state['reco_results']
+        if 'supplier_results' in st.session_state:
+            del st.session_state['supplier_results']
+        gstr2b_df = pd.DataFrame()
 
     # 2. Parse Uploaded Purchase Register
-    if books_file:
-        if books_file.name.lower().endswith('.xls'):
-            try:
-                xl = pd.ExcelFile(books_file)
-                sheet_names = xl.sheet_names
-            except Exception as e:
-                st.error(f"Error reading legacy Excel sheets: {str(e)}")
-        elif books_file.name.lower().endswith(('.xlsx', '.xlsm')):
-            try:
-                wb = load_workbook(books_file, read_only=True)
-                sheet_names = wb.sheetnames
-                wb.close()
-            except Exception as e:
-                st.error(f"Error reading sheets from Excel: {str(e)}")
+    uploaded_books_sigs = [(f.name, f.size) for f in books_files] if books_files else []
+    cached_books_sigs = st.session_state.get('books_files_sigs', [])
+    
+    # Detect file list change and invalidate cache immediately to prevent showing old data
+    if books_files and uploaded_books_sigs != cached_books_sigs:
+        if 'books_df_parsed' in st.session_state:
+            del st.session_state['books_df_parsed']
+        st.session_state['reco_executed'] = False
+        if 'reco_results' in st.session_state:
+            del st.session_state['reco_results']
+        if 'supplier_results' in st.session_state:
+            del st.session_state['supplier_results']
+
+    if books_files:
+        for file in books_files:
+            if file.name.lower().endswith('.xls'):
+                try:
+                    xl = pd.ExcelFile(file)
+                    for s in xl.sheet_names:
+                        if s not in sheet_names:
+                            sheet_names.append(s)
+                except Exception:
+                    pass
+            elif file.name.lower().endswith(('.xlsx', '.xlsm')):
+                try:
+                    wb = load_workbook(file, read_only=True)
+                    for s in wb.sheetnames:
+                        if s not in sheet_names:
+                            sheet_names.append(s)
+                    wb.close()
+                except Exception:
+                    pass
                 
         if len(sheet_names) > 1:
             selected_sheet = st.selectbox("Select Excel Worksheet", options=sheet_names)
             
         try:
-            # Quick head load to fetch headers
-            books_file.seek(0)
-            if books_file.name.endswith('.csv'):
-                header_df = pd.read_csv(books_file, nrows=0)
-            elif books_file.name.lower().endswith('.xls') or books_file.size <= 10 * 1024 * 1024:
-                header_df = pd.read_excel(books_file, sheet_name=selected_sheet or 0, nrows=0)
+            # Quick head load to fetch headers from first file
+            first_file = books_files[0]
+            first_file.seek(0)
+            if first_file.name.endswith('.csv'):
+                header_df = pd.read_csv(first_file, nrows=0)
+            elif first_file.name.lower().endswith('.xls') or first_file.size <= 10 * 1024 * 1024:
+                header_df = pd.read_excel(first_file, sheet_name=selected_sheet or 0, nrows=0)
             else:
                 # Large xlsx file: use openpyxl read_only for low memory
-                wb = load_workbook(books_file, read_only=True)
-                ws = wb[selected_sheet] if selected_sheet else wb.active
+                wb = load_workbook(first_file, read_only=True)
+                ws = wb[selected_sheet] if (selected_sheet and selected_sheet in wb.sheetnames) else wb.active
                 rows = ws.iter_rows(values_only=True)
                 headers_raw = next(rows)
                 wb.close()
@@ -676,7 +606,8 @@ else:
                 ('supplier_name', 'Supplier Name', False),
                 ('doc_type', 'Document Type column', False),
                 ('pos', 'Place of Supply (POS)', False),
-                ('rchrg', 'Reverse Charge (RCM)', False)
+                ('rchrg', 'Reverse Charge (RCM)', False),
+                ('pr_period', 'PR Period / Month', False)
             ]
             
             for idx, (field_id, label, is_required) in enumerate(fields_meta):
@@ -696,46 +627,167 @@ else:
                         
             if st.button("Load Purchase Register"):
                 try:
-                    books_file.seek(0)
-                    books_df = parse_purchase_register(
-                        books_file, 
-                        col_mapping, 
-                        sheet_name=selected_sheet, 
-                        credit_note_convention=cn_convention
-                    )
-                    st.session_state['books_df_parsed'] = books_df
-                    st.success(f"Purchase Register loaded successfully! ({len(books_df)} documents parsed).")
+                    books_dfs = []
+                    for file in books_files:
+                        file.seek(0)
+                        cur_sheet = selected_sheet
+                        if file.name.lower().endswith(('.xlsx', '.xlsm', '.xls')):
+                            if file.name.lower().endswith('.xls'):
+                                xl = pd.ExcelFile(file)
+                                file_sheets = xl.sheet_names
+                            else:
+                                wb = load_workbook(file, read_only=True)
+                                file_sheets = wb.sheetnames
+                                wb.close()
+                            if selected_sheet not in file_sheets:
+                                cur_sheet = file_sheets[0] if file_sheets else 0
+                                
+                        parsed_df = parse_purchase_register(
+                            file, 
+                            col_mapping, 
+                            sheet_name=cur_sheet, 
+                            credit_note_convention=cn_convention
+                        )
+                        parsed_df['books_source_file'] = file.name
+                        books_dfs.append(parsed_df)
+                        
+                    if books_dfs:
+                        books_df = pd.concat(books_dfs, ignore_index=True)
+                        st.session_state['books_df_parsed'] = books_df
+                        st.session_state['books_files_sigs'] = uploaded_books_sigs
+                        st.session_state['books_success_msg'] = f"Successfully loaded {len(books_files)} Purchase Register file(s) ({len(books_df)} total records)."
+                        # Clear reconciliation state to force recalculation on new data
+                        st.session_state['reco_executed'] = False
+                        if 'reco_results' in st.session_state:
+                            del st.session_state['reco_results']
+                        if 'supplier_results' in st.session_state:
+                            del st.session_state['supplier_results']
+                        st.rerun()
                 except Exception as e:
-                    st.error(f"Error loading Purchase Register: {str(e)}")
+                    st.error(f"Error loading Purchase Registers: {str(e)}")
         except Exception as e:
             st.error(f"Error reading file structure: {str(e)}")
+            
+    # If Purchase Register files uploader is cleared, wipe cached data
+    if not books_files and 'books_df_parsed' in st.session_state:
+        del st.session_state['books_df_parsed']
+        if 'books_files_sigs' in st.session_state:
+            del st.session_state['books_files_sigs']
+        st.session_state['reco_executed'] = False
+        if 'reco_results' in st.session_state:
+            del st.session_state['reco_results']
+        if 'supplier_results' in st.session_state:
+            del st.session_state['supplier_results']
+        books_df = pd.DataFrame()
 
 # If books register is loaded in state
-if 'books_df_parsed' in st.session_state and not books_file is None:
+if 'books_df_parsed' in st.session_state:
     books_df = st.session_state['books_df_parsed']
 
+# Show previews of loaded files
+if not gstr2b_df.empty or not books_df.empty:
+    st.markdown("---")
+    st.subheader("🔍 Preview Loaded Data")
+    preview_tabs_titles = []
+    if not books_df.empty:
+        preview_tabs_titles.append("📖 Purchase Register (Books)")
+    if not gstr2b_df.empty:
+        preview_tabs_titles.append("🌐 GSTR-2B Portal Data")
+        
+    if preview_tabs_titles:
+        tabs = st.tabs(preview_tabs_titles)
+        tab_idx = 0
+        if not books_df.empty:
+            with tabs[tab_idx]:
+                st.markdown(f"**Loaded {len(books_df)} records** from Purchase Register:")
+                st.dataframe(books_df.head(10), use_container_width=True)
+            tab_idx += 1
+        if not gstr2b_df.empty:
+            with tabs[tab_idx]:
+                st.markdown(f"**Loaded {len(gstr2b_df)} records** from GSTR-2B Statement:")
+                st.dataframe(gstr2b_df.head(10), use_container_width=True)
+
 # Reconciliation Trigger
-if not gstr2b_df.empty and not books_df.empty:
+has_gstr2b = not gstr2b_df.empty or bool(gstr2b_files)
+has_books = not books_df.empty or bool(books_files)
+
+if has_gstr2b and has_books:
     st.markdown("---")
     st.subheader("🏁 Run Reconciliation Engine")
     
     if st.button("Run Reconciliation", type="primary", use_container_width=True):
         with st.spinner("Executing smart matching engine (analyzing exact match, tolerances, amendments, fuzzy logic, RCM, SEZ, and ISD)..."):
             try:
-                df_reco = reconcile_data(
-                    books_df, 
-                    gstr2b_df, 
-                    val_tolerance=val_tol, 
-                    date_tolerance_days=date_tol, 
-                    fuzzy_threshold=fuzzy_tol
-                )
-                df_supplier = generate_supplier_summary(df_reco)
+                # Fallback: Auto-parse GSTR-2B if files are uploaded but not explicitly loaded
+                if gstr2b_df.empty and gstr2b_files:
+                    dfs = []
+                    for file in gstr2b_files:
+                        file.seek(0)
+                        if file.name.lower().endswith(('.xlsx', '.xlsm', '.xls')):
+                            df = parse_gstr2b_excel(file)
+                        else:
+                            content = file.read().decode('utf-8')
+                            df = parse_gstr2b_json(content, file.name)
+                        dfs.append(df)
+                    if dfs:
+                        gstr2b_df = pd.concat(dfs, ignore_index=True)
+                        st.session_state['gstr2b_df_parsed'] = gstr2b_df
+                        st.session_state['gstr2b_files_sigs'] = uploaded_g2b_sigs
                 
-                # Save in session state
-                st.session_state['reco_results'] = df_reco
-                st.session_state['supplier_results'] = df_supplier
-                st.session_state['reco_executed'] = True
-                st.success("Reconciliation complete!")
+                # Fallback: Auto-parse Purchase Register if files are uploaded but not explicitly loaded
+                if books_df.empty and books_files:
+                    books_dfs = []
+                    for file in books_files:
+                        file.seek(0)
+                        # Build col_mapping dynamically from st.session_state values
+                        col_mapping = {}
+                        for idx, (field_id, label, is_required) in enumerate(fields_meta):
+                            sel = st.session_state.get(f"col_map_{field_id}", "[Not Selected]")
+                            if sel != "[Not Selected]":
+                                col_mapping[field_id] = sel
+                        
+                        cur_sheet = selected_sheet
+                        if file.name.lower().endswith(('.xlsx', '.xlsm', '.xls')):
+                            if file.name.lower().endswith('.xls'):
+                                xl = pd.ExcelFile(file)
+                                file_sheets = xl.sheet_names
+                            else:
+                                wb = load_workbook(file, read_only=True)
+                                file_sheets = wb.sheetnames
+                                wb.close()
+                            if selected_sheet not in file_sheets:
+                                cur_sheet = file_sheets[0] if file_sheets else 0
+                                
+                        parsed_df = parse_purchase_register(
+                            file, 
+                            col_mapping, 
+                            sheet_name=cur_sheet, 
+                            credit_note_convention=cn_convention
+                        )
+                        parsed_df['books_source_file'] = file.name
+                        books_dfs.append(parsed_df)
+                    if books_dfs:
+                        books_df = pd.concat(books_dfs, ignore_index=True)
+                        st.session_state['books_df_parsed'] = books_df
+
+                if gstr2b_df.empty or books_df.empty:
+                    st.error("Cannot run reconciliation: One of the sources has no parsed documents. Please verify your files.")
+                else:
+                    df_reco = reconcile_data(
+                        books_df, 
+                        gstr2b_df, 
+                        val_tolerance=val_tol, 
+                        date_tolerance_days=date_tol, 
+                        fuzzy_threshold=fuzzy_tol,
+                        tax_tolerance=tax_tol
+                    )
+                    df_supplier = generate_supplier_summary(df_reco)
+                    
+                    # Save in session state
+                    st.session_state['reco_results'] = df_reco
+                    st.session_state['supplier_results'] = df_supplier
+                    st.session_state['reco_executed'] = True
+                    st.success("Reconciliation complete!")
             except Exception as e:
                 st.error(f"Failed during reconciliation process: {str(e)}")
 
@@ -757,7 +809,7 @@ if 'reco_executed' in st.session_state and st.session_state['reco_executed']:
         
         # Matches count
         total_rows = len(df_reco)
-        matched_rows = df_reco[df_reco['reco_status'].isin(['Matched', 'Fuzzy Match', 'Matched (Amended)'])].shape[0]
+        matched_rows = df_reco[df_reco['reco_status'].isin(['Matched', 'Fuzzy Match', 'Matched (Amended)', 'Matched (Value-based)'])].shape[0]
         mismatch_rows = df_reco[df_reco['reco_status'].str.contains('Mismatch', na=False)].shape[0]
         only_books_rows = df_reco[df_reco['reco_status'] == 'Only in Books'].shape[0]
         only_2b_rows = df_reco[df_reco['reco_status'] == 'Only in GSTR-2B'].shape[0]
@@ -915,7 +967,7 @@ if 'reco_executed' in st.session_state and st.session_state['reco_executed']:
             df_filtered = df_filtered[(df_filtered['books_gstin'] == gstin_filter) | (df_filtered['gstr2b_gstin'] == gstin_filter)]
             
         if status_filter == "Matched / Fuzzy Match":
-            df_filtered = df_filtered[df_filtered['reco_status'].isin(['Matched', 'Fuzzy Match', 'Matched (Amended)'])]
+            df_filtered = df_filtered[df_filtered['reco_status'].isin(['Matched', 'Fuzzy Match', 'Matched (Amended)', 'Matched (Value-based)'])]
         elif status_filter == "Discrepancy / Mismatch":
             df_filtered = df_filtered[df_filtered['reco_status'].str.contains('Mismatch', na=False)]
         elif status_filter == "Only in Books":
@@ -940,7 +992,7 @@ if 'reco_executed' in st.session_state and st.session_state['reco_executed']:
         # Color coding rows
         def highlight_status(row):
             status = row['reco_status']
-            if status in ('Matched', 'Fuzzy Match', 'Matched (Amended)'):
+            if status in ('Matched', 'Fuzzy Match', 'Matched (Amended)', 'Matched (Value-based)'):
                 return ['background-color: rgba(16, 185, 129, 0.08)'] * len(row)
             elif 'Mismatch' in status:
                 return ['background-color: rgba(245, 158, 11, 0.08)'] * len(row)
@@ -967,26 +1019,69 @@ if 'reco_executed' in st.session_state and st.session_state['reco_executed']:
                     col_order_list.append('gst_law_remark')
                     
                 col_order_list.extend([
-                    'books_gstin', 'books_doc_num', 'books_doc_date', 'books_taxable_val', 'books_igst', 'books_cgst', 'books_sgst'
-                ])
-                
-                if show_compliance_cols:
-                    col_order_list.extend(['books_pos', 'books_rchrg'])
-                    
-                col_order_list.extend([
-                    'gstr2b_gstin', 'gstr2b_doc_num', 'gstr2b_doc_date', 'gstr2b_taxable_val', 'gstr2b_igst', 'gstr2b_cgst', 'gstr2b_sgst'
+                    'gstr2b_gstin', 'gstr2b_supplier_name', 'gstr2b_doc_num', 'gstr2b_doc_date', 
+                    'gstr2b_taxable_val', 'gstr2b_igst', 'gstr2b_cgst', 'gstr2b_sgst', 'gstr2b_cess', 'gstr2b_total_val'
                 ])
                 
                 if show_compliance_cols:
                     col_order_list.extend(['gstr2b_pos', 'gstr2b_rchrg', 'gstr2b_itc_eligibility', 'gstr2b_filing_date', 'gstr2b_gstr3b_status', 'gstr2b_section'])
                     
                 col_order_list.extend([
-                    'taxable_val_diff', 'igst_diff'
+                    'books_gstin', 'books_supplier_name', 'books_doc_num', 'books_doc_date', 
+                    'books_taxable_val', 'books_igst', 'books_cgst', 'books_sgst', 'books_cess', 'books_total_val'
+                ])
+                
+                if show_compliance_cols:
+                    col_order_list.extend(['books_pos', 'books_rchrg', 'books_pr_period'])
+                    
+                col_order_list.extend([
+                    'taxable_val_diff', 'igst_diff', 'cgst_diff', 'sgst_diff', 'cess_diff', 'days_diff'
                 ])
                 
                 st.dataframe(
                     df_disp.style.apply(highlight_status, axis=1),
                     column_order=col_order_list,
+                    column_config={
+                        "reco_status": "Matching Status",
+                        "itc_action": "ITC Action",
+                        "remarks": "Reconciliation Remarks",
+                        "gst_law_remark": "CGST Compliance Laws",
+                        "books_gstin": "Books GSTIN",
+                        "books_supplier_name": "Books Supplier Name",
+                        "books_doc_num": "Books Doc No",
+                        "books_doc_date": "Books Doc Date",
+                        "books_taxable_val": st.column_config.NumberColumn("Books Taxable (₹)", format="%.2f"),
+                        "books_igst": st.column_config.NumberColumn("Books IGST (₹)", format="%.2f"),
+                        "books_cgst": st.column_config.NumberColumn("Books CGST (₹)", format="%.2f"),
+                        "books_sgst": st.column_config.NumberColumn("Books SGST (₹)", format="%.2f"),
+                        "books_cess": st.column_config.NumberColumn("Books Cess (₹)", format="%.2f"),
+                        "books_total_val": st.column_config.NumberColumn("Books Doc Value (₹)", format="%.2f"),
+                        "books_pos": "Books POS",
+                        "books_rchrg": "Books RCM",
+                        "books_pr_period": "PR Period",
+                        "gstr2b_gstin": "Portal GSTIN",
+                        "gstr2b_supplier_name": "Portal Supplier Name",
+                        "gstr2b_doc_num": "Portal Doc No",
+                        "gstr2b_doc_date": "Portal Doc Date",
+                        "gstr2b_taxable_val": st.column_config.NumberColumn("Portal Taxable (₹)", format="%.2f"),
+                        "gstr2b_igst": st.column_config.NumberColumn("Portal IGST (₹)", format="%.2f"),
+                        "gstr2b_cgst": st.column_config.NumberColumn("Portal CGST (₹)", format="%.2f"),
+                        "gstr2b_sgst": st.column_config.NumberColumn("Portal SGST (₹)", format="%.2f"),
+                        "gstr2b_cess": st.column_config.NumberColumn("Portal Cess (₹)", format="%.2f"),
+                        "gstr2b_total_val": st.column_config.NumberColumn("Portal Doc Value (₹)", format="%.2f"),
+                        "gstr2b_pos": "Portal POS",
+                        "gstr2b_rchrg": "Portal RCM",
+                        "gstr2b_itc_eligibility": "ITC Eligibility",
+                        "gstr2b_filing_date": "Portal Filing Date",
+                        "gstr2b_gstr3b_status": "GSTR-3B Status",
+                        "gstr2b_section": "Portal Section",
+                        "taxable_val_diff": st.column_config.NumberColumn("Taxable Diff (₹)", format="%.2f"),
+                        "igst_diff": st.column_config.NumberColumn("IGST Diff (₹)", format="%.2f"),
+                        "cgst_diff": st.column_config.NumberColumn("CGST Diff (₹)", format="%.2f"),
+                        "sgst_diff": st.column_config.NumberColumn("SGST Diff (₹)", format="%.2f"),
+                        "cess_diff": st.column_config.NumberColumn("Cess Diff (₹)", format="%.2f"),
+                        "days_diff": st.column_config.NumberColumn("Days Diff", format="%d")
+                    },
                     use_container_width=True,
                     height=500
                 )
@@ -994,12 +1089,51 @@ if 'reco_executed' in st.session_state and st.session_state['reco_executed']:
                 st.info("No records matching current filters.")
                 
         with explorer_tabs[1]:
-            st.markdown("Grouped supplier-wise summary of reconciliation counts and tax values.")
+            st.markdown("### 🏢 Supplier Performance Analysis")
             if not df_supplier.empty:
                 df_supp_filtered = df_supplier.copy()
                 if gstin_filter != "All":
                     df_supp_filtered = df_supp_filtered[df_supp_filtered['supplier_gstin'] == gstin_filter]
                 
+                # Visual KPIs row
+                sc_1, sc_2 = st.columns(2)
+                
+                with sc_1:
+                    # Bar chart for Top 5 suppliers by absolute ITC variance
+                    df_supp_filtered['abs_itc_diff'] = df_supp_filtered['itc_diff'].abs()
+                    top_diff_suppliers = df_supp_filtered.sort_values(by='abs_itc_diff', ascending=False).head(5)
+                    
+                    fig_diff = px.bar(
+                        top_diff_suppliers,
+                        x='supplier_name',
+                        y='itc_diff',
+                        title="Top 5 Suppliers by ITC Variance (INR)",
+                        labels={'supplier_name': 'Supplier', 'itc_diff': 'ITC Variance (INR)'},
+                        color='itc_diff',
+                        color_continuous_scale='rdbu_r',
+                        text_auto='.2s'
+                    )
+                    fig_diff.update_layout(showlegend=False, height=350, margin=dict(t=40, b=20, l=20, r=20))
+                    st.plotly_chart(fig_diff, use_container_width=True)
+                    
+                with sc_2:
+                    # Bar chart for Suppliers with the lowest Match Rates
+                    worst_match_suppliers = df_supp_filtered.sort_values(by='match_rate_pct', ascending=True).head(5)
+                    
+                    fig_match = px.bar(
+                        worst_match_suppliers,
+                        x='supplier_name',
+                        y='match_rate_pct',
+                        title="Suppliers with Lowest Match Rates (%)",
+                        labels={'supplier_name': 'Supplier', 'match_rate_pct': 'Match Rate (%)'},
+                        color='match_rate_pct',
+                        color_continuous_scale='reds_r',
+                        text_auto='.0f'
+                    )
+                    fig_match.update_layout(showlegend=False, height=350, margin=dict(t=40, b=20, l=20, r=20))
+                    st.plotly_chart(fig_match, use_container_width=True)
+                    
+                st.markdown("#### 📑 Detailed Supplier Summary Table")
                 st.dataframe(
                     df_supp_filtered,
                     column_order=[
@@ -1007,10 +1141,23 @@ if 'reco_executed' in st.session_state and st.session_state['reco_executed']:
                         'books_taxable_val', 'books_total_itc', 'gstr2b_taxable_val', 'gstr2b_total_itc',
                         'taxable_val_diff', 'itc_diff', 'match_rate_pct'
                     ],
+                    column_config={
+                        "supplier_gstin": "Supplier GSTIN",
+                        "supplier_name": "Supplier Name",
+                        "books_invoice_count": st.column_config.NumberColumn("Books Count", format="%d"),
+                        "gstr2b_invoice_count": st.column_config.NumberColumn("2B Count", format="%d"),
+                        "books_taxable_val": st.column_config.NumberColumn("Books Taxable", format="Rs. %.2f"),
+                        "books_total_itc": st.column_config.NumberColumn("Books ITC", format="Rs. %.2f"),
+                        "gstr2b_taxable_val": st.column_config.NumberColumn("2B Taxable", format="Rs. %.2f"),
+                        "gstr2b_total_itc": st.column_config.NumberColumn("2B ITC", format="Rs. %.2f"),
+                        "taxable_val_diff": st.column_config.NumberColumn("Taxable Diff", format="Rs. %.2f"),
+                        "itc_diff": st.column_config.NumberColumn("ITC Diff", format="Rs. %.2f"),
+                        "match_rate_pct": st.column_config.ProgressColumn("Match Rate (%)", format="%.0f%%", min_value=0, max_value=100)
+                    },
                     use_container_width=True,
                     height=450
                 )
             else:
                 st.info("No supplier summaries available.")
 else:
-    st.info("👋 Welcome! Please upload GSTR-2B JSON files and your Purchase Register in the sidebar, or click the **Generate & Load Synthetic Data** button to explore the dashboard immediately.")
+    st.info("👋 Welcome! Please upload GSTR-2B files and your Purchase Register in the sidebar to run the reconciliation dashboard.")
